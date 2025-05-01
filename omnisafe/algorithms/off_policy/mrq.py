@@ -81,6 +81,9 @@ class MRQ(BaseAlgo):
         # utils.set_instance_vars(self.hp, self)
   
         self.history = 1
+        self.exploration_noise = self._cfgs.algo_cfgs.exploration_noise
+        self.noise_clip = self._cfgs.algo_cfgs.noise_clip
+        self.target_policy_noise = self._cfgs.algo_cfgs.target_policy_noise
         if isinstance(self._env.observation_space, spaces.Discrete):
             # Scale action noise since discrete actions are [0,1] and continuous actions are [-1,1].
             self.exploration_noise *= 0.5
@@ -332,12 +335,11 @@ class MRQ(BaseAlgo):
                 epoch * self._samples_per_epoch,
                 (epoch + 1) * self._samples_per_epoch,
             ):
-                step = sample_step * self._update_cycle * self._cfgs.train_cfgs.vector_env_nums
 
                 rollout_start = time.time()
                 # set noise for exploration
                 if self._cfgs.algo_cfgs.use_exploration_noise:
-                    self._actor_critic.actor.noise = self._cfgs.algo_cfgs.exploration_noise
+                    self._actor_critic.actor.noise = self.exploration_noise
 
                 action = self._actor_critic.step(state)
                 
@@ -363,24 +365,11 @@ class MRQ(BaseAlgo):
 
                 # update parameters
                 update_start = time.time()
-                if step > self._cfgs.algo_cfgs.start_learning_steps:
-                    if step % self._cfgs.algo_cfgs.update_iters == 0:
-                        self._update()
-                        self._update_encoder()
-                    buffer_state, buffer_action, buffer_next_state, buffer_reward, buffer_not_done = self.replay_buffer.sample(self._cfgs.algo_cfgs.Q_horizon, include_intermediate=False)
-                    buffer_state, buffer_next_state = maybe_augment_state(buffer_state, buffer_next_state, self.pixel_obs, self._cfgs.algo_cfgs.pixel_augs)
-                    buffer_reward, buffer_term_discount = multi_step_reward(buffer_reward, buffer_not_done, self._cfgs.algo_cfgs.discount)
-                    
-                    Q, Q_target = self.train_rl(buffer_state, buffer_action, buffer_next_state, buffer_reward, buffer_term_discount,
-                        self.reward_scale, self.target_reward_scale)
+                self._train(step)
 
-                    if self._cfgs.algo_cfgs.prioritized:
-                        priority = (Q - Q_target.expand(-1,2)).abs().max(1).values
-                        priority = priority.clamp(min=self._cfgs.algo_cfgs.min_priority).pow(self._cfgs.algo_cfgs.alpha)
-                        self.replay_buffer.update_priority(priority)
                 # if we haven't updated the network, log 0 for the loss
-                else:
-                    self._log_when_not_update()
+                # else:
+                #     self._log_when_not_update()
                 
                 
                 
@@ -423,6 +412,27 @@ class MRQ(BaseAlgo):
         self._env.close()
 
         return ep_ret, ep_cost, ep_len
+    
+    def _train(self, step) -> None:
+        """Train the algorithm.
+
+        -  Update the actor and critic networks.
+        -  Update the encoder network.
+        """
+        if step % self._cfgs.algo_cfgs.target_update_freq == 0:
+            self._update()
+            self._update_encoder()
+        buffer_state, buffer_action, buffer_next_state, buffer_reward, buffer_not_done = self.replay_buffer.sample(self._cfgs.algo_cfgs.Q_horizon, include_intermediate=False)
+        buffer_state, buffer_next_state = maybe_augment_state(buffer_state, buffer_next_state, self.pixel_obs, self._cfgs.algo_cfgs.pixel_augs)
+        buffer_reward, buffer_term_discount = multi_step_reward(buffer_reward, buffer_not_done, self._cfgs.algo_cfgs.discount)
+        
+        Q, Q_target = self.train_rl(buffer_state, buffer_action, buffer_next_state, buffer_reward, buffer_term_discount,
+            self.reward_scale, self.target_reward_scale)
+
+        if self._cfgs.algo_cfgs.prioritized:
+            priority = (Q - Q_target.expand(-1,2)).abs().max(1).values
+            priority = priority.clamp(min=self._cfgs.algo_cfgs.min_priority).pow(self._cfgs.algo_cfgs.alpha)
+            self.replay_buffer.update_priority(priority)
     
     def _update(self) -> None:
         """Update actor, critic.
@@ -551,7 +561,7 @@ class MRQ(BaseAlgo):
         with torch.no_grad():
             next_zs = self._actor_critic.target_encoder.zs(next_state)
 
-            noise = (torch.randn_like(action) * self._cfgs.algo_cfgs.target_policy_noise).clamp(-self._cfgs.algo_cfgs.noise_clip, self._cfgs.algo_cfgs.noise_clip)
+            noise = (torch.randn_like(action) * self.target_policy_noise).clamp(-self.noise_clip, self.noise_clip)
             next_action = realign(self._actor_critic.target_actor.predict(next_zs) + noise, self.discrete) # Clips to (-1,1) OR one_hot of argmax.
 
             next_zsa = self._actor_critic.target_encoder(next_zs, next_action)
