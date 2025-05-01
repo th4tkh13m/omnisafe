@@ -51,6 +51,7 @@ from omnisafe.envs.core import CMDP, make
 from omnisafe.envs.wrapper import ActionRepeat, ActionScale, ObsNormalize, TimeLimit
 from omnisafe.models.actor import ActorBuilder
 from omnisafe.models.actor_critic import ConstraintActorCritic, ConstraintActorQCritic
+from omnisafe.models.actor_critic.mrq_actor_q_critic import MRQActorQCritic, MRQActor, MRQCritic, Encoder
 from omnisafe.models.base import Actor
 from omnisafe.utils.config import Config
 
@@ -289,18 +290,57 @@ class Evaluator:  # pylint: disable=too-many-instance-attributes
                     high=np.hstack((observation_space.high, np.inf)),
                     shape=(observation_space.shape[0] + 1,),
                 )
-            actor_type = self._cfgs['model_cfgs']['actor_type']
-            pi_cfg = self._cfgs['model_cfgs']['actor']
-            weight_initialization_mode = self._cfgs['model_cfgs']['weight_initialization_mode']
-            actor_builder = ActorBuilder(
-                obs_space=observation_space,
-                act_space=action_space,
-                hidden_sizes=pi_cfg['hidden_sizes'],
-                activation=pi_cfg['activation'],
-                weight_initialization_mode=weight_initialization_mode,
-            )
-            self._actor = actor_builder.build_actor(actor_type)
-            self._actor.load_state_dict(model_params['pi'])
+            if 'MRQ' in self._cfgs['algo']:
+                history = 1
+                obs_shape = self._env.observation_space.shape
+                state_shape = [obs_shape[0] * history]
+                discrete = not isinstance(self._env.observation_space, Box)
+                max_action = 1 if discrete else float(self._env.action_space.high[0])
+                encoder = Encoder(self._env.observation_space, self._env.action_space,
+                    self._cfgs.algo_cfgs.num_bins,
+                    self._cfgs.algo_cfgs.zs_dim, 
+                    self._cfgs.algo_cfgs.za_dim, 
+                    self._cfgs.algo_cfgs.zsa_dim,
+                    self._cfgs.algo_cfgs.enc_hdim, 
+                    self._cfgs.algo_cfgs.enc_activ).to("cpu")
+
+
+                policy = MRQActor(self._env.observation_space, 
+                                    self._env.action_space, 
+                                    self._cfgs.algo_cfgs.gumbel_tau, 
+                                    self._cfgs.algo_cfgs.zs_dim,
+                                    self._cfgs.algo_cfgs.policy_hdim, 
+                                    self._cfgs.algo_cfgs.policy_activ).to("cpu")
+
+                value = MRQCritic(self._cfgs.algo_cfgs.zsa_dim, 
+                                self._cfgs.algo_cfgs.value_hdim, 
+                                self._cfgs.algo_cfgs.value_activ).to("cpu")
+                self._actor_critic = MRQActorQCritic(
+                    actor=policy,
+                    critic=value,
+                    encoder=encoder,
+                    actor_optimizer=None,
+                    reward_critic_optimizer=None,
+                    encoder_optimizer=None,
+                    state_shape=state_shape,
+                    discrete=discrete,
+                    max_action=max_action,
+                )
+                
+                self._actor_critic.load_state_dict(model_params['actor_critic'])
+            else:
+                actor_type = self._cfgs['model_cfgs']['actor_type']
+                pi_cfg = self._cfgs['model_cfgs']['actor']
+                weight_initialization_mode = self._cfgs['model_cfgs']['weight_initialization_mode']
+                actor_builder = ActorBuilder(
+                    obs_space=observation_space,
+                    act_space=action_space,
+                    hidden_sizes=pi_cfg['hidden_sizes'],
+                    activation=pi_cfg['activation'],
+                    weight_initialization_mode=weight_initialization_mode,
+                )
+                self._actor = actor_builder.build_actor(actor_type)
+                self._actor.load_state_dict(model_params['pi'])
 
         if self._cfgs['algo'] in ['CRABS']:
             self._init_crabs(model_params)
@@ -413,7 +453,7 @@ class Evaluator:  # pylint: disable=too-many-instance-attributes
         Raises:
             ValueError: If the environment and the policy are not provided or created.
         """
-        if self._env is None or (self._actor is None and self._planner is None):
+        if self._env is None or (self._actor is None and self._planner is None and ("MRQ" in self._cfgs["algo"] and self._actor_critic is None)):
             raise ValueError(
                 'The environment and the policy must be provided or created before evaluating the agent.',
             )
@@ -448,6 +488,16 @@ class Evaluator:  # pylint: disable=too-many-instance-attributes
                         )[
                             0
                         ].squeeze(0)
+                    elif ("MRQ" in self._cfgs["algo"] and self._actor_critic is not None):
+                        act = self._actor_critic.step(
+                            obs.reshape(
+                                -1,
+                                obs.shape[-1],  # to make sure the shape is (1, obs_dim)
+                            ),
+                            deterministic=True,
+                        ).reshape(
+                            -1,  # to make sure the shape is (act_dim,)
+                        )
                     else:
                         raise ValueError(
                             'The policy must be provided or created before evaluating the agent.',
@@ -528,7 +578,7 @@ class Evaluator:  # pylint: disable=too-many-instance-attributes
             self._env is not None
         ), 'The environment must be provided or created before rendering.'
         assert (
-            self._actor is not None or self._planner is not None
+            self._actor is not None or self._planner is not None or ("MRQ" in self._cfgs["algo"] and self._actor_critic is not None)
         ), 'The policy or planner must be provided or created before rendering.'
         if save_replay_path is None:
             save_replay_path = os.path.join(self._save_dir, 'video', self._model_name.split('.')[0])
@@ -576,6 +626,16 @@ class Evaluator:  # pylint: disable=too-many-instance-attributes
                         )[
                             0
                         ].squeeze(0)
+                    elif ("MRQ" in self._cfgs["algo"] and self._actor_critic is not None):
+                        act = self._actor_critic.step(
+                            obs.reshape(
+                                -1,
+                                obs.shape[-1],  # to make sure the shape is (1, obs_dim)
+                            ),
+                            deterministic=True,
+                        ).reshape(
+                            -1,  # to make sure the shape is (act_dim,)
+                        )
                     else:
                         raise ValueError(
                             'The policy must be provided or created before evaluating the agent.',

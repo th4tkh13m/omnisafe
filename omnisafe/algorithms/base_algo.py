@@ -49,7 +49,6 @@ class BaseAlgo(ABC):  # pylint: disable=too-few-public-methods
         self._init_model()
 
         self._init()
-
         self._init_log()
 
     @property
